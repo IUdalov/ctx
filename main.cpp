@@ -1,80 +1,15 @@
+#include "coro_multiplexer.h"
+#include "bsearch.h"
+
 #include <iostream>
-#include <boost/context/all.hpp>
 #include <chrono>
-#include <list>
 #include <vector>
 #include <random>
-#include <deque>
-#include <optional>
-#include <queue>
-
 
 constexpr size_t TEST_DATA_BYTES = 500'000'000;
 constexpr size_t SEARCHES = 5'000'000;
 //constexpr size_t TEST_DATA_BYTES = 5000;
 //constexpr size_t SEARCHES = 5;
-constexpr size_t NCORO = 4;
-
-// __builtin_expect()
-
-class Limiter;
-Limiter* _gLimiter = nullptr;
-#define PREFETCH_ADDR(addr) { __builtin_prefetch((addr), 0, 3); if (_gLimiter) _gLimiter->next(); }
-
-#define LOG if (false) std::cout
-
-namespace ctx = boost::context;
-
-class Limiter {
-public:
-    using Action = std::function<bool()>;
-public:
-    explicit Limiter(const Action& cAction) {
-
-        alive_.resize(NCORO, true);
-        for(size_t i = 0; i < NCORO; i++)
-            tasks_.emplace_back(ctx::callcc([this, cAction, i] (ctx::continuation sink) {
-
-                LOG << "created " << i << std::endl;
-                self_.emplace_back(sink.resume());
-
-                LOG << "started " << i << std::endl;
-                while(cAction());
-
-                LOG << "dead " << i << std::endl;
-                alive_[i] = false;
-
-                return std::move(self_[i]);
-            }));
-    };
-
-    inline void run() {
-        assert(!tasks_.empty());
-
-        bool hasAliveCoro = true;
-        while(hasAliveCoro) {
-            hasAliveCoro = false;
-            for(size_t i = 0; i < NCORO; i++) {
-                curr = i;
-                if (alive_[i]) {
-                    tasks_[i] = tasks_[i].resume();
-                    hasAliveCoro = true;
-                }
-            }
-        }
-    }
-
-    inline void next() {
-        LOG << "next " << curr << std::endl;
-        self_[curr] = self_[curr].resume();
-    }
-
-private:
-    size_t curr = 0;
-    std::vector<bool> alive_;
-    std::vector<ctx::continuation> tasks_;
-    std::vector<ctx::continuation> self_;
-};
 
 std::vector<int64_t> generateData(size_t nelems) {
     std::vector<int64_t> data;
@@ -89,34 +24,7 @@ std::vector<int64_t> generateData(size_t nelems) {
     return data;
 }
 
-bool bsearch(const std::vector<int64_t>& data, int64_t target) noexcept {
-    size_t left = 0;
-    size_t right = data.size();
-
-    PREFETCH_ADDR(&data[left]);
-    if (data[left] == target)
-        return true;
-
-    PREFETCH_ADDR(&data[right]);
-    if (data[right] == target)
-        return true;
-
-    while(right - left > 1) {
-        size_t mid = left + (right  - left) / 2;
-        PREFETCH_ADDR(&data[mid]);
-
-        if (data[mid] == target)
-            return true;
-        else if (data[mid] > target)
-            right = mid;
-        else
-            left = mid;
-    }
-
-    return false;
-}
-
-std::chrono::milliseconds mesureTime(std::function<void()> f) {
+std::chrono::milliseconds execTime(const std::function<void()> f) {
     auto begin = std::chrono::steady_clock::now();
     f();
     auto end = std::chrono::steady_clock::now();
@@ -140,21 +48,22 @@ int main(int, char**) {
             searchData[i] = dis(gen);
     }
 
-    auto noCoroScore = mesureTime([&] {
-        for(const auto& target : searchData)
-            validateRes(target, bsearch(data, target));
+    std::cout << "Running " << searchData.size() << " searches on " << (data.size() * sizeof(int64_t) / 1'000)  << " Kb" << std::endl;
+    auto noCoroScore = execTime([&] {
+        for (const auto &target : searchData)
+            validateRes(target, bSearch(data, target));
     });
 
-    std::cout << "#\tno coro score: " << noCoroScore.count() << "ms" << std::endl;
+    std::cout << "#\tno coro score: " << noCoroScore.count() << " ms" << std::endl;
 
-    auto coroScore = mesureTime([&] {
+    auto coroScore = execTime([&] {
         size_t nextPeek = 0;
         size_t end = searchData.size();
 
-        _gLimiter = new Limiter([&] () -> bool {
+        _gLimiter = new CoroMultiplexer<N_COROUTINES>([&]() -> bool {
             int64_t target = searchData[nextPeek];
             nextPeek++;
-            validateRes(target, bsearch(data, target));
+            validateRes(target, coroBSearch(data, target));
 
             return nextPeek < end;
         });
@@ -162,11 +71,11 @@ int main(int, char**) {
         _gLimiter->run();
     });
 
+    std::cout << "#\tcoro score: " << coroScore.count() << " ms" << std::endl;
     delete _gLimiter;
     _gLimiter = nullptr;
 
-
-    std::cout << "#\tcoro score: " << coroScore.count() << "ms" << std::endl;
+    std::cout << "Speedup: " <<  (1 - static_cast<double>(coroScore.count()) / static_cast<double>(noCoroScore.count())) << "% faster" << std::endl;
 
     return 0;
 }
